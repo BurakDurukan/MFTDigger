@@ -46,7 +46,7 @@ During triage, the questions are usually simple: *what was on this disk, where i
 ## Quick start
 
 ```bash
-git clone https://github.com/<user>/MFTDigger.git
+git clone https://github.com/BurakDurukan/MFTDigger.git
 cd MFTDigger
 python MFTDigger.py                # interactive menu
 python MFTDigger.py --help         # command line
