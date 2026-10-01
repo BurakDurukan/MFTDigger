@@ -133,20 +133,6 @@ Version 1.4.0 was also cross-validated against **The Sleuth Kit** on real `ntfs-
 ## Limitations
 
 - **E01 is not supported.** Convert to raw first with `ewfexport` or FTK Imager.
-- **Live volumes can change while they are being read.** For a consistent view, collect from a VSS snapshot or analyse an image.
-- **Not decoded yet**: WOF/Compact OS content (XPRESS/LZX), `$Secure` owner SIDs, INDX entries, `$UsnJrnl`, `$LogFile`, VSS. These files are flagged, not silently returned as zeros.
-- The 1.4.0 validation used `ntfs-3g` volumes. Testing on Windows-written volumes and on live `\\.\C:` is the next step.
-
-## Roadmap
-
-1. **Windows correctness**: WOF/XPRESS/LZX decoding, `$Secure` owner SID, Dedup.
-2. **More evidence sources**: `$UsnJrnl`, INDX slack, VSS, `$LogFile`.
-3. **Integrations**: Timesketch JSONL, Velociraptor artifact, KAPE module, SQLite output.
-4. **R&D**:
-   - MFT record slack carving
-   - distribution-based timestomp detection
-   - USN/LSN monotonicity analysis
-   - one-command recovery of deleted resident files
 
 ## Author
 
