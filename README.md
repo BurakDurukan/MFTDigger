@@ -1,5 +1,7 @@
 # MFTDigger
 
+[![tests](https://github.com/BurakDurukan/MFTDigger/actions/workflows/tests.yml/badge.svg)](https://github.com/BurakDurukan/MFTDigger/actions/workflows/tests.yml)
+
 A single Python file that reads the NTFS `$MFT` and lets you dump it, search it and pull files out of it. It only uses the standard library (Python 3.8 or newer), so there is nothing to install: copy `MFTDigger.py` to the analysis box and run it.
 
 It takes a raw disk image, a live volume or a `$MFT` file collected with KAPE or Velociraptor. I wrote it for triage work, where the questions are mostly the same every time: what was on this disk, when did it change, and can I still get the deleted file back?
