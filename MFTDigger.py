@@ -15,9 +15,12 @@ Input sources
 
 Commands
   info        Volume / $MFT summary and partition table
-  dump        Dump every MFT record (CSV / JSONL / bodyfile)
+  dump        Dump every MFT record (CSV / TSV / JSONL / bodyfile / HTML / Markdown / grid)
   search      Find records by name / path / regex / extension / time / state, print location
   export      Extract a file's $DATA (or an ADS) from disk, with hash + metadata sidecar
+  report      Re-filter an existing dump offline into HTML / Markdown / CSV
+  record      Show one record in detail
+  verify      Compare $MFT records 0-3 with $MFTMirr
   extract-mft Copy the raw $MFT out of the volume for other tools
 
 Everything that goes wrong is reported on stderr - the tool never silently
@@ -38,7 +41,7 @@ import struct
 import sys
 import time
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 TOOL_NAME = "MFTDigger"
 
 ATTR_STANDARD_INFORMATION = 0x10
@@ -57,6 +60,8 @@ ATTR_EA_INFORMATION = 0xD0
 ATTR_EA = 0xE0
 ATTR_LOGGED_UTILITY_STREAM = 0x100
 ATTR_END = 0xFFFFFFFF
+
+NAMESPACE_RANK = {3: 0, 1: 1, 0: 2, 2: 3}
 
 ATTR_NAMES = {
     0x10: "$STANDARD_INFORMATION", 0x20: "$ATTRIBUTE_LIST", 0x30: "$FILE_NAME",
@@ -100,24 +105,32 @@ EPOCH_DIFF_100NS = 116444736000000000
 _VERBOSE = False
 
 
+def printable(text):
+    text = str(text)
+    if text.isprintable():
+        return text
+    return "".join(c if c.isprintable() else ("\\x%02x" % ord(c) if ord(c) < 256 else "\\u%04x" % ord(c))
+                   for c in text)
+
+
 def log(msg):
-    sys.stderr.write("[*] %s\n" % msg)
+    sys.stderr.write("[*] %s\n" % printable(msg))
     sys.stderr.flush()
 
 
 def warn(msg):
-    sys.stderr.write("[!] %s\n" % msg)
+    sys.stderr.write("[!] %s\n" % printable(msg))
     sys.stderr.flush()
 
 
 def err(msg):
-    sys.stderr.write("[X] %s\n" % msg)
+    sys.stderr.write("[X] %s\n" % printable(msg))
     sys.stderr.flush()
 
 
 def dbg(msg):
     if _VERBOSE:
-        sys.stderr.write("[d] %s\n" % msg)
+        sys.stderr.write("[d] %s\n" % printable(msg))
         sys.stderr.flush()
 
 
@@ -325,64 +338,133 @@ def is_ntfs_boot_sector(b):
 
 
 GPT_MAX_ENTRIES = 1024
+EXTENDED_TYPES = (0x05, 0x0F, 0x85)
+MAX_LOGICAL_PARTITIONS = 128
+
+
+def foreign_volume_kind(sector):
+    if len(sector) < 512:
+        return ""
+    oem = sector[3:11]
+    if oem == b"-FVE-FS-":
+        return "a BitLocker-encrypted volume (unlock or decrypt it first)"
+    if oem == b"EXFAT   ":
+        return "an exFAT volume"
+    if oem[:4] == b"ReFS":
+        return "a ReFS volume"
+    if sector[510:512] == b"\x55\xAA" and (sector[0x52:0x57] == b"FAT32" or sector[0x36:0x39] == b"FAT"):
+        return "a FAT volume"
+    return ""
+
+
+def _mbr_entries(sector):
+    out = []
+    for i in range(4):
+        e = sector[446 + i * 16: 446 + (i + 1) * 16]
+        out.append((e[4], struct.unpack("<I", e[8:12])[0], struct.unpack("<I", e[12:16])[0]))
+    return out
+
+
+def _logical_partitions(src, ext_lba, sector_size):
+    out = []
+    pending = [ext_lba]
+    seen = set()
+    while pending and len(seen) < MAX_LOGICAL_PARTITIONS:
+        ebr_lba = pending.pop(0)
+        if ebr_lba in seen:
+            continue
+        seen.add(ebr_lba)
+        try:
+            ebr = src.read(ebr_lba * sector_size, 512)
+        except MftError:
+            continue
+        if len(ebr) < 512 or ebr[510:512] != b"\x55\xAA":
+            continue
+        for ptype, lba, cnt in _mbr_entries(ebr):
+            if not ptype or not cnt:
+                continue
+            if ptype in EXTENDED_TYPES:
+                pending.append(ext_lba + lba)
+            else:
+                out.append((ptype, ebr_lba + lba, cnt))
+    return out
+
+
+def _gpt_partitions(src, sector_size):
+    hdr = src.read(sector_size, 512)
+    if hdr[:8] != b"EFI PART":
+        return None
+    entries_lba = struct.unpack("<Q", hdr[72:80])[0]
+    n_entries = struct.unpack("<I", hdr[80:84])[0]
+    entry_size = struct.unpack("<I", hdr[84:88])[0]
+    if entry_size < 128 or entry_size > 4096 or entry_size % 8:
+        warn("GPT header: implausible entry size %d - assuming 128" % entry_size)
+        entry_size = 128
+    if n_entries > GPT_MAX_ENTRIES:
+        warn("GPT header claims %d entries - only the first %d are read (corrupt or tampered header?)"
+             % (n_entries, GPT_MAX_ENTRIES))
+        n_entries = GPT_MAX_ENTRIES
+    table = src.read(entries_lba * sector_size, n_entries * entry_size)
+    parts = []
+    for i in range(n_entries):
+        e = table[i * entry_size:(i + 1) * entry_size]
+        if len(e) < 56 or e[:16] == b"\x00" * 16:
+            continue
+        first = struct.unpack("<Q", e[32:40])[0]
+        last = struct.unpack("<Q", e[40:48])[0]
+        name = e[56:128].decode("utf-16le", "replace").rstrip("\x00")
+        parts.append({"start_offset": first * sector_size, "length": (last - first + 1) * sector_size,
+                      "type": "GPT:%s" % (name or "?")})
+    return parts
+
+
+def _partitions_for(src, mbr, sector_size):
+    entries = _mbr_entries(mbr)
+    if any(ptype == 0xEE for ptype, _lba, _cnt in entries):
+        try:
+            return _gpt_partitions(src, sector_size) or []
+        except MftError:
+            return []
+    parts = []
+    for ptype, lba, cnt in entries:
+        if ptype == 0 or cnt == 0:
+            continue
+        if ptype in EXTENDED_TYPES:
+            for ltype, llba, lcnt in _logical_partitions(src, lba, sector_size):
+                parts.append({"start_offset": llba * sector_size, "length": lcnt * sector_size,
+                              "type": "MBR:0x%02X(logical)" % ltype})
+            continue
+        parts.append({"start_offset": lba * sector_size, "length": cnt * sector_size,
+                      "type": "MBR:0x%02X" % ptype})
+    return parts
 
 
 def find_partitions(src):
-    parts = []
     try:
         mbr = src.read(0, 512)
     except MftError:
-        return parts
+        return []
     if len(mbr) < 512 or mbr[510:512] != b"\x55\xAA":
-        return parts
-    gpt = False
-    for i in range(4):
-        e = mbr[446 + i * 16: 446 + (i + 1) * 16]
-        ptype = e[4]
-        lba = struct.unpack("<I", e[8:12])[0]
-        cnt = struct.unpack("<I", e[12:16])[0]
-        if ptype == 0xEE:
-            gpt = True
-        if ptype == 0 or cnt == 0:
-            continue
-        parts.append({"index": len(parts), "start_offset": lba * 512, "length": cnt * 512,
-                      "type": "MBR:0x%02X" % ptype, "ntfs": False})
-    if gpt:
-        parts = []
-        try:
-            hdr = src.read(512, 512)
-            if hdr[:8] == b"EFI PART":
-                entries_lba = struct.unpack("<Q", hdr[72:80])[0]
-                n_entries = struct.unpack("<I", hdr[80:84])[0]
-                entry_size = struct.unpack("<I", hdr[84:88])[0]
-
-                if entry_size < 128 or entry_size > 4096 or entry_size % 8:
-                    warn("GPT header: implausible entry size %d - assuming 128" % entry_size)
-                    entry_size = 128
-                if n_entries > GPT_MAX_ENTRIES:
-                    warn("GPT header claims %d entries - only the first %d are read (corrupt or tampered header?)"
-                         % (n_entries, GPT_MAX_ENTRIES))
-                    n_entries = GPT_MAX_ENTRIES
-                table = src.read(entries_lba * 512, n_entries * entry_size)
-                for i in range(n_entries):
-                    e = table[i * entry_size:(i + 1) * entry_size]
-                    if len(e) < 56 or e[:16] == b"\x00" * 16:
-                        continue
-                    first = struct.unpack("<Q", e[32:40])[0]
-                    last = struct.unpack("<Q", e[40:48])[0]
-                    name = e[56:128].decode("utf-16le", "replace").rstrip("\x00")
-                    parts.append({"index": len(parts), "start_offset": first * 512,
-                                  "length": (last - first + 1) * 512,
-                                  "type": "GPT:%s" % (name or "?"), "ntfs": False})
-        except MftError:
-            pass
-    for p in parts:
-        try:
-            p["ntfs"] = is_ntfs_boot_sector(src.read(p["start_offset"], 512))
-        except MftError:
-            p["ntfs"] = False
-    return parts
-
+        return []
+    if is_ntfs_boot_sector(mbr) or foreign_volume_kind(mbr):
+        return []
+    fallback = []
+    for sector_size in (512, 4096):
+        parts = _partitions_for(src, mbr, sector_size)
+        for i, part in enumerate(parts):
+            part["index"] = i
+            part["sector_size"] = sector_size
+            try:
+                boot = src.read(part["start_offset"], 512)
+            except MftError:
+                boot = b""
+            part["ntfs"] = is_ntfs_boot_sector(boot)
+            part["fs"] = "" if part["ntfs"] else foreign_volume_kind(boot)
+        if any(part["ntfs"] for part in parts):
+            return parts
+        if not fallback:
+            fallback = parts
+    return fallback
 
 
 def parse_data_runs(buf):
@@ -543,7 +625,7 @@ class MftRecord:
         best = None
         best_rank = 99
         for fn in self.file_names:
-            rank = {3: 0, 1: 1, 0: 2, 2: 3}.get(fn.namespace, 4)
+            rank = NAMESPACE_RANK.get(fn.namespace, 4)
             if rank < best_rank:
                 best, best_rank = fn, rank
         return best
@@ -606,6 +688,8 @@ def parse_attributes(buf, attr_off, record_number):
         a.length = alen
         a.offset = pos
         nonres, name_len = struct.unpack_from("<BB", buf, pos + 8)
+        if alen < (24 if nonres == 0 else 64):
+            raise MftError("Attribute 0x%X at +%d has a truncated header (length %d)" % (atype, pos, alen))
         name_off, a.flags, a.id = struct.unpack_from("<HHH", buf, pos + 10)
         if name_len:
             a.name = buf[pos + name_off: pos + name_off + name_len * 2].decode("utf-16le", "replace")
@@ -723,6 +807,8 @@ def parse_record(buf, number, sector_size=512):
             rec.attributes.append(a)
     except MftError as e:
         rec.error = str(e)
+    except (struct.error, IndexError) as e:
+        rec.error = "malformed attribute: %s" % e
     rec.valid = True
     _post_process(rec)
     return rec
@@ -795,6 +881,8 @@ class MftFileSource(MftSource):
         head = self.fh.read(0x30)
         if head[:4] not in (b"FILE", b"BAAD"):
             raise MftError("%s does not start with a FILE record - not an $MFT file" % path)
+        if len(head) < 0x30:
+            raise MftError("%s is too short to hold an MFT record" % path)
         alloc = struct.unpack_from("<I", head, 0x1C)[0]
         if alloc not in (1024, 4096, 512, 2048):
             warn("Unusual record size %d in %s, assuming 1024" % (alloc, path))
@@ -844,6 +932,9 @@ class NtfsVolume:
         self.src = src
         bs = src.read(0, 512)
         if not is_ntfs_boot_sector(bs):
+            kind = foreign_volume_kind(bs)
+            if kind:
+                raise MftError("Offset %d holds %s, not NTFS" % (src.base, kind))
             raise MftError("No NTFS boot sector at offset %d (OEM=%r)" % (src.base, bs[3:11]))
         self.bytes_per_sector = struct.unpack_from("<H", bs, 0x0B)[0]
         self.sectors_per_cluster = bs[0x0D]
@@ -1098,6 +1189,14 @@ class MftVolumeSource(MftSource):
                     rec = data[pos:pos + rs]
                     if hasher is not None:
                         hasher.update(rec)
+                    if n < MIRROR_RECORDS and rec[:4] not in (b"FILE", b"BAAD"):
+                        try:
+                            mirror = self.read_mirror_raw(n)
+                        except MftError:
+                            mirror = b""
+                        if mirror[:4] in (b"FILE", b"BAAD"):
+                            self.mirror_used.add(n)
+                            rec = mirror
                     if n >= start:
                         yield n, rec
                     n += 1
@@ -1108,6 +1207,7 @@ class MftVolumeSource(MftSource):
 
     def close(self):
         self.vol.src.close()
+
 
 def open_source(path, offset=None, partition=None):
     try:
@@ -1134,6 +1234,10 @@ def open_source(path, offset=None, partition=None):
         vol = NtfsVolume(src)
         return MftVolumeSource(vol)
 
+    kind = foreign_volume_kind(head)
+    if kind:
+        raise MftError("%s is %s, not NTFS" % (path, kind))
+
     parts = find_partitions(src)
     ntfs_parts = [p for p in parts if p["ntfs"]]
     if not parts:
@@ -1143,11 +1247,14 @@ def open_source(path, offset=None, partition=None):
             raise MftError("Partition index %d out of range (found %d)" % (partition, len(parts)))
         p = parts[partition]
         if not p["ntfs"]:
-            raise MftError("Partition %d (%s) is not NTFS" % (partition, p["type"]))
+            raise MftError("Partition %d (%s) is not NTFS%s" % (partition, p["type"],
+                                                               " - it is %s" % p["fs"] if p.get("fs") else ""))
     else:
         if not ntfs_parts:
             raise MftError("No NTFS partition found in %s. Partitions: %s" %
-                           (path, ", ".join("%d=%s@%d" % (p["index"], p["type"], p["start_offset"]) for p in parts)))
+                           (path, ", ".join("%d=%s@%d%s" % (p["index"], p["type"], p["start_offset"],
+                                                           " [%s]" % p["fs"] if p.get("fs") else "")
+                                            for p in parts)))
         p = ntfs_parts[0]
         if len(ntfs_parts) > 1:
             warn("Multiple NTFS partitions found, using #%d (%s @ %d). Use --partition to pick another: %s" %
@@ -1173,11 +1280,32 @@ class PathResolver:
             return
         self.index[rec.number] = (fn.parent_ref, fn.parent_seq, fn.name, rec.seq, rec.in_use)
 
+    def add_from_extension(self, number, seq, in_use, candidates, current_rank=5):
+        best = None
+        best_rank = current_rank
+        for base_seq, fn in candidates:
+            if not self._seq_matches((None, None, None, seq, in_use), base_seq):
+                continue
+            rank = NAMESPACE_RANK.get(fn.namespace, 4)
+            if rank < best_rank:
+                best, best_rank = fn, rank
+        if best is not None:
+            self.index[number] = (best.parent_ref, best.parent_seq, best.name, seq, in_use)
+
+    @staticmethod
+    def _seq_matches(entry, parent_seq):
+        if entry[3] == parent_seq:
+            return True
+        if entry[4]:
+            return False
+        freed_seq = parent_seq + 1 if parent_seq < 0xFFFF else 1
+        return entry[3] == freed_seq
+
     def parent_matches(self, child_parent_ref, child_parent_seq):
         p = self.index.get(child_parent_ref)
         if p is None:
             return False
-        return p[3] == child_parent_seq
+        return self._seq_matches(p, child_parent_seq)
 
     def resolve(self, number, depth=0):
         if number in self._cache:
@@ -1208,7 +1336,7 @@ class PathResolver:
         pentry = self.index.get(parent_ref)
         if pentry is None:
             return "%s/<parent-%d-missing>/%s" % (self.ORPHAN, parent_ref, name)
-        if pentry[3] != parent_seq:
+        if not self._seq_matches(pentry, parent_seq):
             return "%s/<parent-%d-seq-mismatch>/%s" % (self.ORPHAN, parent_ref, name)
         ppath = self.resolve(parent_ref, depth + 1)
         return (ppath + "/" + name) if ppath else name
@@ -1225,7 +1353,7 @@ DUMP_FIELDS = [
 ]
 
 
-def record_to_row(rec, resolver, mft, include_runs=True, bitmap=None):
+def record_to_row(rec, resolver, mft, include_runs=True, bitmap=None, contested=None):
     fn = rec.best_file_name()
     si = rec.std_info
     data = rec.get_data_attr("")
@@ -1298,6 +1426,8 @@ def record_to_row(rec, resolver, mft, include_runs=True, bitmap=None):
     clusters_free = ""
     if bitmap is not None and not rec.in_use and data and not data[0].resident:
         clusters_free = bitmap.runs_state([r for d in data for r in d.runs])
+    if contested and not rec.in_use and clusters_free in ("yes", "") and rec.number in contested:
+        clusters_free = "contested"
 
     return {
         "record": rec.number,
@@ -1346,6 +1476,19 @@ def record_to_row(rec, resolver, mft, include_runs=True, bitmap=None):
         "error": rec.error,
     }
 
+
+
+def shared_run_owners(intervals):
+    shared = {}
+    active = []
+    for start, end, owner in sorted(intervals):
+        active = [x for x in active if x[0] > start]
+        for _end, other in active:
+            if other != owner:
+                shared.setdefault(owner, set()).add(other)
+                shared.setdefault(other, set()).add(owner)
+        active.append((end, owner))
+    return {k: sorted(v) for k, v in shared.items()}
 
 
 class VolumeBitmap:
@@ -1400,6 +1543,8 @@ class Engine:
         self.mft_hash_note = "not computed"
         self._bitmap = None
         self._bitmap_loaded = False
+        self.contested = {}
+        self._freed_created = {}
 
     @property
     def mft_hash_scope(self):
@@ -1460,6 +1605,9 @@ class Engine:
         hasher = hashlib.sha256()
         errors_before = self.mft.read_errors
         self.mft_hash_note = "index pass did not complete"
+        ext_names = {}
+        weak = {}
+        freed_runs = []
         for n, raw in self.mft.iter_raw(hasher=hasher):
             if not raw or raw[:4] not in (b"FILE", b"BAAD"):
                 continue
@@ -1472,10 +1620,32 @@ class Engine:
                 continue
             if rec.is_extension:
                 self._ext_map.setdefault(rec.base_ref, []).append(n)
+                if rec.file_names:
+                    ext_names.setdefault(rec.base_ref, []).append((rec.base_seq, rec.best_file_name()))
             else:
                 self.resolver.add(rec)
+                best = rec.best_file_name()
+                rank = NAMESPACE_RANK.get(best.namespace, 4) if best is not None else 5
+                if rank > 1:
+                    weak[n] = (rec.seq, rec.in_use, rank)
+            if not rec.in_use:
+                owner = rec.base_ref if rec.is_extension else n
+                before = len(freed_runs)
+                for a in rec.attributes:
+                    if a.type == ATTR_DATA and not a.resident:
+                        for lcn, length in a.runs:
+                            if lcn is not None and length > 0:
+                                freed_runs.append((lcn, lcn + length, owner))
+                if len(freed_runs) > before and not rec.is_extension and rec.file_names:
+                    self._freed_created[n] = rec.best_file_name().created
             if progress and n and n % 200000 == 0:
                 log("  index pass: %d / %d records" % (n, total))
+        for base, candidates in ext_names.items():
+            if base in weak:
+                seq, in_use, rank = weak[base]
+                self.resolver.add_from_extension(base, seq, in_use, candidates, rank)
+        self.contested = shared_run_owners(freed_runs)
+        self._freed_created = {n: t for n, t in self._freed_created.items() if n in self.contested}
         bad = self.mft.read_errors - errors_before
         if bad:
             self.mft_sha256 = None
@@ -1488,6 +1658,16 @@ class Engine:
         self._indexed = True
         dbg("index built: %d names, %d extension records in %.1fs" %
             (len(self.resolver.index), sum(len(v) for v in self._ext_map.values()), time.time() - t0))
+
+    def likely_owner(self, number):
+        group = [number] + self.contested.get(number, [])
+        times = [self._freed_created.get(n) for n in group]
+        if len(group) < 2 or any(not t for t in times):
+            return None
+        latest = max(times)
+        if times.count(latest) != 1:
+            return None
+        return group[times.index(latest)]
 
     def _merge_extensions(self, rec):
         if rec.is_extension:
@@ -1771,11 +1951,11 @@ var d=rows.filter(function(r){return r.in_use==='no'}).length,s=rows.filter(func
 st.innerHTML='showing <b>'+view.length+'</b> of <b>'+rows.length+'</b> rows &middot; deleted <b>'+d+'</b> &middot; timestomp indicators <b>'+s+'</b> &middot; with ADS <b>'+a+'</b>';
 document.querySelectorAll('th .s').forEach(function(e){e.textContent=''});var th=document.querySelector('th[data-k="'+sortK+'"] .s');if(th)th.textContent=sortD>0?'\u25B2':'\u25BC'}
 function render(){var h='',end=Math.min(view.length,shown+PAGE);for(var i=shown;i<end;i++){var r=view[i];
-h+='<tr class="r'+(r.in_use==='no'?' del':'')+'" data-i="'+r._i+'"><td class="num">'+r.record+'</td><td>'+badges(r)+'</td><td class="path">'+esc(r.path||r.name||'')+'</td><td class="num" title="'+r.size+' bytes">'+hs(r.size)+'</td><td class="ts">'+esc(r.si_created)+'</td><td class="ts">'+esc(r.si_modified)+'</td><td class="ts">'+esc(r.fn_created)+'</td><td>'+ind(r)+'</td><td class="ts">'+esc(r.loc)+'</td></tr>'}
+h+='<tr class="r'+(r.in_use==='no'?' del':'')+'" data-i="'+r._i+'"><td class="num">'+esc(r.record)+'</td><td>'+badges(r)+'</td><td class="path">'+esc(r.path||r.name||'')+'</td><td class="num" title="'+esc(r.size)+' bytes">'+hs(r.size)+'</td><td class="ts">'+esc(r.si_created)+'</td><td class="ts">'+esc(r.si_modified)+'</td><td class="ts">'+esc(r.fn_created)+'</td><td>'+ind(r)+'</td><td class="ts">'+esc(r.loc)+'</td></tr>'}
 tb.insertAdjacentHTML('beforeend',h);shown=end;more.hidden=shown>=view.length;more.textContent='Show more rows ('+(view.length-shown)+' remaining)'}
 function detail(r){var keys=Object.keys(r).filter(function(k){return k[0]!=='_'&&k!=='state'&&k!=='ind'&&k!=='loc'});var g='';
 keys.forEach(function(k){g+='<div><span class="k">'+esc(k)+'</span> '+esc(r[k])+'</div>'});
-return '<div class="det"><div class="g">'+g+'</div><code>MFTDigger.py export '+esc(SRC)+' --record '+r.record+(r.ads_count>0?' --ads':'')+' -o evidence/</code></div>'}
+return '<div class="det"><div class="g">'+g+'</div><code>MFTDigger.py export '+esc(SRC)+' --record '+esc(r.record)+(r.ads_count>0?' --ads':'')+' -o evidence/</code></div>'}
 tb.addEventListener('click',function(e){var tr=e.target.closest('tr.r');if(!tr)return;var nx=tr.nextElementSibling;if(nx&&nx.classList.contains('det')){nx.remove();return}
 var r=rows[+tr.dataset.i],d=document.createElement('tr');d.className='det';d.innerHTML='<td colspan="9">'+detail(r)+'</td>';tr.after(d)});
 document.querySelectorAll('th').forEach(function(th){th.addEventListener('click',function(){var k=th.dataset.k;if(sortK===k)sortD=-sortD;else{sortK=k;sortD=1}apply()})});
@@ -1831,8 +2011,13 @@ def open_grid(csv_path, title, all_columns=False):
                    "PowerShell 7 needs Install-Module Microsoft.PowerShell.GraphicalTools)")
 
 
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
 class RowWriter:
-    def __init__(self, fmt, out, fields=DUMP_FIELDS, title="", source="", kind="", max_rows=0):
+    def __init__(self, fmt, out, fields=DUMP_FIELDS, title="", source="", kind="", max_rows=0,
+                 excel_safe=False):
+        self.excel_safe = excel_safe
         self.fmt = fmt
         self.out = out
         self.title = title
@@ -1877,6 +2062,9 @@ class RowWriter:
             self.truncated = True
             return
         if self.fmt in ("csv", "tsv"):
+            if self.excel_safe:
+                row = {k: ("'" + v if isinstance(v, str) and v[:1] in FORMULA_PREFIXES else v)
+                       for k, v in row.items()}
             self.w.writerow(row)
         elif self.fmt == "jsonl":
             self.out.write(json.dumps({k: row.get(k) for k in self.fields}, ensure_ascii=False) + "\n")
@@ -1884,7 +2072,7 @@ class RowWriter:
             self._body(row)
         elif self.fmt == "html":
             s = json.dumps({k: row.get(k) for k in self.fields}, ensure_ascii=False)
-            self.out.write(s.replace("</", "<\\/") + "\n")
+            self.out.write(s.replace("<", "\\u003c") + "\n")
         elif self.fmt == "md":
             self._md(row)
 
@@ -1902,7 +2090,7 @@ class RowWriter:
                                  (os.path.basename(sys.argv[0]), _quote(engine_source_path or "<source>"), recs))
             return
         if self.fmt == "html":
-            self.out.write(HTML_TAIL.replace("__SRC__", json.dumps(self.source).replace("</", "<\\/")))
+            self.out.write(HTML_TAIL.replace("__SRC__", json.dumps(self.source).replace("<", "\\u003c")))
         elif self.fmt == "md":
             self.out.write("\n_%d row(s)%s. Timestamps UTC. Location: R = resident, else first LCN (run count)._\n" % (
                 min(self.count, self.max_rows) if self.max_rows else self.count,
@@ -1921,8 +2109,8 @@ class RowWriter:
         for k, _ in MD_COLS:
             v = str(r.get(k, "") or "")
             v = v.replace("|", "\\|").replace("\n", " ")
-            if k == "path":
-                v = "`%s`" % v if v else ""
+            if k == "path" and v:
+                v = "`` %s ``" % v if "`" in v else "`%s`" % v
             cells.append(v)
         self.out.write("| " + " | ".join(cells) + " |\n")
 
@@ -1982,10 +2170,13 @@ def _iter_dump_file(path):
 
 def cmd_report(args):
     pred = _row_filter_from_args(args)
+    with open(args.input, "r", encoding="utf-8", newline="") as fh:
+        if not fh.read(4096).strip():
+            raise MftError("%s is empty - nothing to report" % args.input)
     out, close = open_output(args.output)
     title = "report from %s: %s" % (os.path.basename(args.input), " ".join(_criteria_text(args)))
     writer = RowWriter(args.format, out, title=title, source=args.input, kind="dump-file",
-                       max_rows=_max_rows(args))
+                       max_rows=_max_rows(args), excel_safe=args.excel_safe)
     n = 0
     try:
         for row in _iter_dump_file(args.input):
@@ -2032,13 +2223,19 @@ def cmd_info(args, engine):
         except MftError as e:
             warn("Cannot read $Volume record: %s" % e)
         if args.partitions:
-            parts = find_partitions(RawSource(args.source, 0))
+            raw = RawSource(args.source, 0)
+            try:
+                parts = find_partitions(raw)
+            finally:
+                raw.close()
             if parts:
                 print("\nPartition table:")
                 for p in parts:
                     print("  #%d  %-24s start=%-14d size=%-12s %s" % (
                         p["index"], p["type"], p["start_offset"], human_size(p["length"]),
-                        "NTFS" if p["ntfs"] else ""))
+                        "NTFS" if p["ntfs"] else p.get("fs", "")))
+            else:
+                print("\nPartition table: none (the input is a volume, not a partitioned disk)")
     else:
         print("$MFT file size : %s" % human_size(mft.size))
         print("Record size    : %d" % mft.record_size)
@@ -2068,6 +2265,27 @@ def cmd_info(args, engine):
     return 0
 
 
+def _parse_record_numbers(tokens):
+    out = []
+    for tok in tokens:
+        for part in tok.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    lo, hi = int(a), int(b)
+                    if hi < lo:
+                        raise ValueError(part)
+                    out.extend(range(lo, hi + 1))
+                else:
+                    out.append(int(part))
+            except ValueError:
+                raise MftError("Bad --record value '%s' (use N, N,N or A-B)" % part)
+    return out
+
+
 def _row_filter_from_args(args):
     checks = []
     if getattr(args, "in_use_only", False):
@@ -2080,6 +2298,8 @@ def _row_filter_from_args(args):
         checks.append(lambda r: r["is_dir"] == "no")
     if getattr(args, "ads_only", False):
         checks.append(lambda r: r["ads_count"] > 0)
+    if getattr(args, "clusters_free", None):
+        checks.append(lambda r: r.get("clusters_free") == args.clusters_free)
     subsec = getattr(args, "include_subsec", False)
     if getattr(args, "suspicious", False):
         checks.append(lambda r: "SI<FN" in r["suspicious"] or (subsec and "SI_SUBSEC_ZERO" in r["suspicious"])
@@ -2107,15 +2327,7 @@ def _row_filter_from_args(args):
             raise MftError("Bad regex: %s" % e)
         checks.append(lambda r: bool(rx.search(r["path"]) or rx.search(r["name"])))
     if getattr(args, "record", None):
-        wanted = set()
-        for tok in args.record:
-            for part in tok.split(","):
-                part = part.strip()
-                if "-" in part:
-                    a, b = part.split("-", 1)
-                    wanted.update(range(int(a), int(b) + 1))
-                elif part:
-                    wanted.add(int(part))
+        wanted = set(_parse_record_numbers(args.record))
         checks.append(lambda r: r["record"] in wanted)
     ts_field = getattr(args, "time_field", "any")
     after = getattr(args, "after", None)
@@ -2153,13 +2365,14 @@ def cmd_dump(args, engine):
     engine.build_index()
     bitmap = engine.volume_bitmap
     writer = RowWriter(args.format, out, title="MFT dump", source=args.source, kind=engine.mft.kind,
-                       max_rows=_max_rows(args))
+                       max_rows=_max_rows(args), excel_safe=args.excel_safe)
     t0 = time.time()
     try:
         for rec in engine.iter_records(merge=not args.no_merge):
             if rec.is_extension and not args.include_extension:
                 continue
-            row = record_to_row(rec, engine.resolver, engine.mft, include_runs=not args.no_runs, bitmap=bitmap)
+            row = record_to_row(rec, engine.resolver, engine.mft, include_runs=not args.no_runs, bitmap=bitmap,
+                                contested=engine.contested)
             if pred(row):
                 writer.write(row)
         writer.close()
@@ -2236,7 +2449,9 @@ def _print_location(row, rec, engine):
     if row.get("clusters_free"):
         lines.append("  $Bitmap: clusters still free = %s%s" % (row["clusters_free"], {
             "yes": "  (content probably intact)", "no": "  (all reallocated - content belongs to another file)",
-            "partial": "  (partly overwritten)", "?": "  (outside $Bitmap)"}.get(row["clusters_free"], "")))
+            "partial": "  (partly overwritten)", "?": "  (outside $Bitmap)",
+            "contested": "  (free, but also claimed by deleted record(s) %s - content may be theirs)" %
+                         ",".join(str(x) for x in engine.contested.get(rec.number, []))}.get(row["clusters_free"], "")))
     lines.append("  MFT record offset: %s%s" % (
         row["mft_offset"], "" if vol is None else "  (physical: %d)" % (row["mft_offset"] + vol.src.base) if row["mft_offset"] != "" else ""))
     data = rec.get_data_attr("")
@@ -2278,7 +2493,7 @@ def _print_location(row, rec, engine):
         lines.append("  ! parse error: %s" % rec.error)
     lines.append("  export: %s export %s --record %d -o <dir>" % (
         os.path.basename(sys.argv[0]), _quote(engine_source_path), rec.number))
-    return "\n".join(lines)
+    return "\n".join(printable(line) for line in lines)
 
 
 args_max_runs = 8
@@ -2299,7 +2514,8 @@ def _max_rows(args):
 
 def _criteria_text(args):
     parts = []
-    for k in ("name", "path", "regex", "record", "ext", "after", "before", "min_size", "max_size"):
+    for k in ("name", "path", "regex", "record", "ext", "after", "before", "min_size", "max_size",
+              "clusters_free"):
         v = getattr(args, k, None)
         if v is None or v is False or v == []:
             continue
@@ -2314,25 +2530,26 @@ def _criteria_text(args):
 
 
 def cmd_search(args, engine):
-    if not any([args.name, args.path, args.regex, args.record, args.ext, args.deleted_only, args.ads_only,
-                args.suspicious, args.timestomp, args.after, args.before, args.min_size is not None,
-                args.max_size is not None]):
+    if not any([args.name, args.path, args.regex, args.record, args.ext, args.deleted_only, args.in_use_only,
+                args.dirs_only, args.files_only, args.ads_only, args.suspicious, args.timestomp, args.after,
+                args.before, args.min_size is not None, args.max_size is not None, args.clusters_free]):
         raise MftError("search needs at least one criterion (--name/--path/--regex/--record/--ext/"
-                       "--deleted-only/--ads-only/--timestomp/--after/--before/--min-size/--max-size)")
+                       "--deleted-only/--in-use-only/--dirs-only/--files-only/--ads-only/--suspicious/"
+                       "--timestomp/--clusters-free/--after/--before/--min-size/--max-size)")
     pred = _row_filter_from_args(args)
     engine.build_index()
     bitmap = engine.volume_bitmap
     out, close = open_output(args.output)
     title = "search: " + " ".join(_criteria_text(args))
     writer = (RowWriter(args.format, out, title=title, source=args.source, kind=engine.mft.kind,
-                        max_rows=_max_rows(args)) if args.format != "text" else None)
+                        max_rows=_max_rows(args), excel_safe=args.excel_safe) if args.format != "text" else None)
     hits = 0
     t0 = time.time()
     try:
         for rec in engine.iter_records(merge=not args.no_merge):
             if rec.is_extension:
                 continue
-            row = record_to_row(rec, engine.resolver, engine.mft, bitmap=bitmap)
+            row = record_to_row(rec, engine.resolver, engine.mft, bitmap=bitmap, contested=engine.contested)
             if not pred(row):
                 continue
             hits += 1
@@ -2370,12 +2587,7 @@ def _safe_name(name):
 def _find_export_targets(args, engine):
     targets = []
     if args.record:
-        for tok in args.record:
-            for part in tok.split(","):
-                part = part.strip()
-                if part:
-                    targets.append(int(part))
-        return targets
+        return _parse_record_numbers(args.record)
     engine.build_index()
     want_path = [p.lower().replace("\\", "/").strip("/") for p in (args.path or [])]
     want_path = [re.sub(r"^[a-z]:/", "", p) for p in want_path]
@@ -2395,6 +2607,8 @@ def _find_export_targets(args, engine):
 
 
 EXPORT_OK_STATUSES = ("ok", "directory")
+MAX_EXPORT_NAME = 160
+MAX_EXPORT_STREAM_NAME = 60
 
 
 class _HashingWriter:
@@ -2437,7 +2651,7 @@ def cmd_export(args, engine):
         for n in targets:
             try:
                 res = _export_one(args, engine, n)
-            except (MftError, OverflowError, ValueError, struct.error, IndexError) as e:
+            except (MftError, OSError, OverflowError, ValueError, struct.error, IndexError) as e:
                 err("Record %d: %s" % (n, e))
                 res = dict(engine.custody(), record=n, status="error", error=str(e),
                            exported_at=_utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -2458,9 +2672,10 @@ def _export_one(args, engine, n):
     rec = engine.get_record(n, merge=True)
     if not rec.valid:
         raise MftError("record invalid: %s" % rec.error)
-    row = record_to_row(rec, engine.resolver, engine.mft, bitmap=engine.volume_bitmap)
+    row = record_to_row(rec, engine.resolver, engine.mft, bitmap=engine.volume_bitmap,
+                        contested=engine.contested)
     fn = rec.best_file_name()
-    base_name = _safe_name(fn.name) if fn else "record_%d" % n
+    base_name = _safe_name(fn.name)[:MAX_EXPORT_NAME] if fn else "record_%d" % n
     stem = "%06d_%s" % (n, base_name)
     result = engine.custody()
     result.update({
@@ -2489,6 +2704,18 @@ def _export_one(args, engine, n):
         elif cf == "partial":
             msg = ("record is DELETED and $Bitmap shows SOME of its clusters reallocated - content is "
                    "partly overwritten")
+        elif cf == "contested":
+            others = engine.contested.get(n, [])
+            owner = engine.likely_owner(n)
+            result["clusters_shared_with"] = others
+            result["clusters_likely_owner"] = owner
+            msg = ("record is DELETED and its clusters are also claimed by deleted record(s) %s - $Bitmap "
+                   "shows them free, but the content was probably overwritten by the later file; verify with "
+                   "file signature / hash" % ",".join(str(x) for x in others))
+            if owner == n:
+                msg += ". This record has the latest $FN creation time of the group, so the bytes are most likely its own"
+            elif owner is not None:
+                msg += ". Record %d has the latest $FN creation time of the group and is the more likely owner" % owner
         else:
             msg = ("record is DELETED - clusters may have been reused; content is best-effort carving, "
                    "verify with file signature / hash")
@@ -2502,7 +2729,8 @@ def _export_one(args, engine, n):
         result["raw_record_file"] = os.path.basename(rr_path)
         result["raw_record_sha256"] = hashlib.sha256(rec.raw).hexdigest()
 
-    if rec.is_dir and not rec.ads_names() and not args.stream:
+    dir_without_data = rec.is_dir and not rec.get_data_attr("")
+    if dir_without_data and args.stream is None and not (args.ads and rec.ads_names()):
         result["status"] = "directory"
         result["warnings"].append("directory record: no $DATA stream (index attributes only); raw record saved")
         _write_sidecar(args, stem, result)
@@ -2513,7 +2741,7 @@ def _export_one(args, engine, n):
     if args.stream is not None:
         streams = [args.stream]
     else:
-        streams = [""] + (rec.ads_names() if args.ads else [])
+        streams = ([] if dir_without_data else [""]) + (rec.ads_names() if args.ads else [])
     incomplete = False
     for sname in streams:
         parts = rec.get_data_attr(sname)
@@ -2524,12 +2752,20 @@ def _export_one(args, engine, n):
             incomplete = True
             continue
         p0 = parts[0]
-        out_name = stem if sname == "" else "%s__ADS_%s" % (stem, _safe_name(sname))
+        out_name = stem if sname == "" else "%s__ADS_%s" % (stem, _safe_name(sname)[:MAX_EXPORT_STREAM_NAME])
         out_path = os.path.join(args.out, out_name)
         size = p0.size
         if args.max_size and size > args.max_size:
             result["warnings"].append("stream '%s' (%d bytes) exceeds --max-size; skipped" % (sname, size))
             warn("Record %d: stream %s is %s > --max-size; skipped" % (n, sname or "$DATA", human_size(size)))
+            incomplete = True
+            continue
+        vol = engine.mft.volume
+        if not args.max_size and vol is not None and not p0.resident and size > vol.volume_size:
+            msg = ("stream '%s' declares %d bytes, more than the whole volume (%d) - skipped; pass --max-size "
+                   "to export it anyway" % (sname or "$DATA", size, vol.volume_size))
+            result["warnings"].append(msg)
+            warn("Record %d: %s" % (n, msg))
             incomplete = True
             continue
         if not p0.resident and engine.mft.volume is None:
@@ -2601,6 +2837,8 @@ def _export_one(args, engine, n):
         result["status"] = "reallocated"            
     elif not rec.in_use and result.get("clusters_free") == "partial":
         result["status"] = "partially-reallocated"
+    elif not rec.in_use and result.get("clusters_free") == "contested":
+        result["status"] = "contested"
     if args.preserve_times and result["streams"]:
         try:
             si = rec.std_info
@@ -2650,7 +2888,8 @@ def cmd_extract_mft(args, engine):
 def cmd_record(args, engine):
     engine.build_index()
     rec = engine.get_record(args.number, merge=True)
-    row = record_to_row(rec, engine.resolver, engine.mft, bitmap=engine.volume_bitmap)
+    row = record_to_row(rec, engine.resolver, engine.mft, bitmap=engine.volume_bitmap,
+                        contested=engine.contested)
     print(_print_location(row, rec, engine))
     if rec.index_root is not None:
         ir = rec.index_root
@@ -2722,6 +2961,8 @@ def _add_filter_args(p, for_search=False):
     g.add_argument("--dirs-only", action="store_true")
     g.add_argument("--files-only", action="store_true")
     g.add_argument("--ads-only", action="store_true", help="only records with alternate data streams")
+    g.add_argument("--clusters-free", choices=["yes", "no", "partial", "contested"],
+                   help="only deleted records whose clusters are in this state (yes = probably recoverable)")
     g.add_argument("--timestomp", action="store_true", help="only $SI created < $FN created (add --include-subsec "
                                                              "for whole-second $SI times)")
     g.add_argument("--suspicious", action="store_true", help="any structural / timestamp indicator")
@@ -2776,6 +3017,9 @@ exit codes: 0 ok, 1 error / incomplete export, 2 no match, 3 verify mismatch, 13
     s.add_argument("--include-extension", action="store_true", help="also emit extension records as rows")
     s.add_argument("--no-merge", action="store_true", help="skip $ATTRIBUTE_LIST extension merge (faster)")
     s.add_argument("--no-runs", action="store_true", help="omit data_runs column (smaller output)")
+    s.add_argument("--excel-safe", action="store_true",
+                   help="csv/tsv: prefix cells that start with = + - @ with an apostrophe so a spreadsheet "
+                        "does not run them as formulas")
     _add_filter_args(s)
     s.set_defaults(func=cmd_dump)
 
@@ -2792,6 +3036,9 @@ exit codes: 0 ok, 1 error / incomplete export, 2 no match, 3 verify mismatch, 13
     s.add_argument("--no-merge", action="store_true", help="skip $ATTRIBUTE_LIST extension merge (faster)")
     s.add_argument("--limit", type=int, default=0, help="stop after N hits")
     s.add_argument("--max-runs", type=int, default=8, help="data runs to print per hit in text mode")
+    s.add_argument("--excel-safe", action="store_true",
+                   help="csv/tsv: prefix cells that start with = + - @ with an apostrophe so a spreadsheet "
+                        "does not run them as formulas")
     _add_filter_args(s, for_search=True)
     s.set_defaults(func=cmd_search)
 
@@ -2805,7 +3052,9 @@ exit codes: 0 ok, 1 error / incomplete export, 2 no match, 3 verify mismatch, 13
     s.add_argument("--ads", action="store_true", help="also export all alternate data streams")
     s.add_argument("--include-deleted", action="store_true", help="let --path/--name match deleted records")
     s.add_argument("--max-files", type=int, default=200, help="safety cap for --name matches")
-    s.add_argument("--max-size", type=int, default=0, help="skip streams larger than BYTES (0 = no limit)")
+    s.add_argument("--max-size", type=int, default=0,
+                   help="skip streams larger than BYTES (0 = no limit, except that a stream declaring more "
+                        "than the whole volume is skipped)")
     s.add_argument("--no-raw-record", action="store_true", help="do not save the raw 1 KB MFT record")
     s.add_argument("--preserve-times", action="store_true", help="set exported file mtime/atime from $SI")
     s.set_defaults(func=cmd_export)
@@ -2819,6 +3068,9 @@ exit codes: 0 ok, 1 error / incomplete export, 2 no match, 3 verify mismatch, 13
     s.add_argument("--grid-all-columns", action="store_true", help="grid: show every column, not the compact set")
     s.add_argument("--open", action="store_true", help="open the html output in the default browser when done")
     s.add_argument("--limit", type=int, default=0, help="stop after N matching rows")
+    s.add_argument("--excel-safe", action="store_true",
+                   help="csv/tsv: prefix cells that start with = + - @ with an apostrophe so a spreadsheet "
+                        "does not run them as formulas")
     s.add_argument("-v", "--verbose", action="store_true")
     _add_filter_args(s)
     s.set_defaults(func=cmd_report, offline=True)
@@ -2842,6 +3094,11 @@ exit codes: 0 ok, 1 error / incomplete export, 2 no match, 3 verify mismatch, 13
 
 def main(argv=None):
     global _VERBOSE, args_max_runs, engine_source_path, _GRID_ALL
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     _VERBOSE = args.verbose
@@ -2922,6 +3179,7 @@ def print_banner():
     """ % __version__
     print(banner)
 
+
 def print_main_menu():
     print("\n" + "="*60)
     print("                MFT DIGGER - MAIN MENU")
@@ -2937,6 +3195,7 @@ def print_main_menu():
     print("9.  Exit/Quit")
     print("="*60)
 
+
 def print_info_menu():
     print("\n" + "-"*50)
     print("           INFORMATION & ANALYSIS")
@@ -2948,6 +3207,7 @@ def print_info_menu():
     print("5. Verify $MFT records 0-3 against $MFTMirr")
     print("6. Back to main menu")
     print("-"*50)
+
 
 def print_dump_menu():
     print("\n" + "-"*50)
@@ -2964,6 +3224,7 @@ def print_dump_menu():
     print("9. Dump with custom filters")
     print("10. Back to main menu")
     print("-"*50)
+
 
 def print_search_menu():
     print("\n" + "-"*50)
@@ -2982,6 +3243,7 @@ def print_search_menu():
     print("11. Back to main menu")
     print("-"*50)
 
+
 def get_source_input():
     print("\nEnter source (device/image/$MFT file):")
     print("Examples:")
@@ -2993,9 +3255,6 @@ def get_source_input():
     source = input("Source: ").strip().strip('"')
     return source if source else None
 
-def get_confirmation(prompt="Continue? (y/N): "):
-    response = input(prompt).strip().lower()
-    return response in ['y', 'yes']
 
 def run_info_command():
     source = get_source_input()
@@ -3007,25 +3266,26 @@ def run_info_command():
         print_info_menu()
         choice = input("Select option: ").strip()
 
-        if choice == '1':
-            sys.argv = ['MFTDigger.py', 'info', source]
+        if choice == "1":
+            sys.argv = ["MFTDigger.py", "info", source]
             _run_menu()
-        elif choice == '2':
-            sys.argv = ['MFTDigger.py', 'info', source, '--partitions']
+        elif choice == "2":
+            sys.argv = ["MFTDigger.py", "info", source, "--partitions"]
             _run_menu()
-        elif choice == '3':
-            sys.argv = ['MFTDigger.py', 'info', source, '--stats']
+        elif choice == "3":
+            sys.argv = ["MFTDigger.py", "info", source, "--stats"]
             _run_menu()
-        elif choice == '4':
-            sys.argv = ['MFTDigger.py', 'info', source, '--partitions', '--stats']
+        elif choice == "4":
+            sys.argv = ["MFTDigger.py", "info", source, "--partitions", "--stats"]
             _run_menu()
-        elif choice == '5':
-            sys.argv = ['MFTDigger.py', 'verify', source]
+        elif choice == "5":
+            sys.argv = ["MFTDigger.py", "verify", source]
             _run_menu()
-        elif choice == '6':
+        elif choice == "6":
             break
         else:
             print("Invalid option. Please try again.")
+
 
 def run_dump_command():
     source = get_source_input()
@@ -3037,42 +3297,42 @@ def run_dump_command():
         print_dump_menu()
         choice = input("Select option: ").strip()
 
-        if choice == '1':
+        if choice == "1":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "-o", output]
             _run_menu()
-        elif choice == '2':
+        elif choice == "2":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '--format', 'tsv', '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "--format", "tsv", "-o", output]
             _run_menu()
-        elif choice == '3':
+        elif choice == "3":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '--format', 'jsonl', '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "--format", "jsonl", "-o", output]
             _run_menu()
-        elif choice == '4':
+        elif choice == "4":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '--format', 'body', '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "--format", "body", "-o", output]
             _run_menu()
-        elif choice == '5':
+        elif choice == "5":
             output = input("Output file (required): ").strip()
             if not output:
                 print("Output file is required for HTML format.")
                 continue
-            sys.argv = ['MFTDigger.py', 'dump', source, '--format', 'html', '-o', output, '--open']
+            sys.argv = ["MFTDigger.py", "dump", source, "--format", "html", "-o", output, "--open"]
             _run_menu()
-        elif choice == '6':
+        elif choice == "6":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '--format', 'md', '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "--format", "md", "-o", output]
             _run_menu()
-        elif choice == '7':
+        elif choice == "7":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '--deleted-only', '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "--deleted-only", "-o", output]
             _run_menu()
-        elif choice == '8':
+        elif choice == "8":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'dump', source, '--in-use-only', '-o', output]
+            sys.argv = ["MFTDigger.py", "dump", source, "--in-use-only", "-o", output]
             _run_menu()
-        elif choice == '9':
+        elif choice == "9":
             print("\nEnter filters (press Enter to skip):")
             name = input("  --name (glob): ").strip()
             path = input("  --path (substring): ").strip()
@@ -3082,24 +3342,25 @@ def run_dump_command():
 
             output = input("Output file (default: stdout): ").strip() or "-"
 
-            sys.argv = ['MFTDigger.py', 'dump', source]
+            sys.argv = ["MFTDigger.py", "dump", source]
             if name:
-                sys.argv.extend(['--name', name])
+                sys.argv.extend(["--name", name])
             if path:
-                sys.argv.extend(['--path', path])
+                sys.argv.extend(["--path", path])
             if ext:
-                sys.argv.extend(['--ext', ext])
+                sys.argv.extend(["--ext", ext])
             if after:
-                sys.argv.extend(['--after', after])
+                sys.argv.extend(["--after", after])
             if before:
-                sys.argv.extend(['--before', before])
-            sys.argv.extend(['-o', output])
+                sys.argv.extend(["--before", before])
+            sys.argv.extend(["-o", output])
 
             _run_menu()
-        elif choice == '10':
+        elif choice == "10":
             break
         else:
             print("Invalid option. Please try again.")
+
 
 def run_search_command():
     source = get_source_input()
@@ -3111,55 +3372,55 @@ def run_search_command():
         print_search_menu()
         choice = input("Select option: ").strip()
 
-        if choice == '1':
+        if choice == "1":
             name = input("Enter filename pattern (glob, e.g. *.exe): ").strip()
             if not name:
                 print("Filename pattern is required.")
                 continue
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--name', name, '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--name", name, "-o", output]
             _run_menu()
-        elif choice == '2':
+        elif choice == "2":
             path = input("Enter path substring: ").strip()
             if not path:
                 print("Path substring is required.")
                 continue
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--path', path, '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--path", path, "-o", output]
             _run_menu()
-        elif choice == '3':
+        elif choice == "3":
             regex = input("Enter regex pattern: ").strip()
             if not regex:
                 print("Regex pattern is required.")
                 continue
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--regex', regex, '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--regex", regex, "-o", output]
             _run_menu()
-        elif choice == '4':
+        elif choice == "4":
             record = input("Enter record number(s) or range (e.g. 100,200,500-510): ").strip()
             if not record:
                 print("Record specification is required.")
                 continue
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--record', record, '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--record", record, "-o", output]
             _run_menu()
-        elif choice == '5':
+        elif choice == "5":
             ext = input("Enter extensions (comma-separated, e.g. exe,dll,ps1): ").strip()
             if not ext:
                 print("Extensions are required.")
                 continue
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--ext', ext, '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--ext", ext, "-o", output]
             _run_menu()
-        elif choice == '6':
+        elif choice == "6":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--deleted-only', '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--deleted-only", "-o", output]
             _run_menu()
-        elif choice == '7':
+        elif choice == "7":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--ads-only', '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--ads-only", "-o", output]
             _run_menu()
-        elif choice == '8':
+        elif choice == "8":
             print("\nEnter time window (press Enter to skip):")
             after = input("  --after (date, e.g. 2026-09-01): ").strip()
             before = input("  --before (date, e.g. 2026-09-30): ").strip()
@@ -3171,21 +3432,21 @@ def run_search_command():
 
             output = input("Output file (default: stdout): ").strip() or "-"
 
-            sys.argv = ['MFTDigger.py', 'search', source]
+            sys.argv = ["MFTDigger.py", "search", source]
             if after:
-                sys.argv.extend(['--after', after])
+                sys.argv.extend(["--after", after])
             if before:
-                sys.argv.extend(['--before', before])
+                sys.argv.extend(["--before", before])
             if time_field != "any":
-                sys.argv.extend(['--time-field', time_field])
-            sys.argv.extend(['-o', output])
+                sys.argv.extend(["--time-field", time_field])
+            sys.argv.extend(["-o", output])
 
             _run_menu()
-        elif choice == '9':
+        elif choice == "9":
             output = input("Output file (default: stdout): ").strip() or "-"
-            sys.argv = ['MFTDigger.py', 'search', source, '--timestomp', '-o', output]
+            sys.argv = ["MFTDigger.py", "search", source, "--timestomp", "-o", output]
             _run_menu()
-        elif choice == '10':
+        elif choice == "10":
             print("\nEnter filters (press Enter to skip):")
             name = input("  --name (glob): ").strip()
             path = input("  --path (substring): ").strip()
@@ -3195,60 +3456,61 @@ def run_search_command():
             after = input("  --after (date): ").strip()
             before = input("  --before (date): ").strip()
             time_field = input("  --time-field (default: any): ").strip() or "any"
-            deleted_only = input("  --deleted-only? (y/N): ").strip().lower() in ['y', 'yes']
-            in_use_only = input("  --in-use-only? (y/N): ").strip().lower() in ['y', 'yes']
-            dirs_only = input("  --dirs-only? (y/N): ").strip().lower() in ['y', 'yes']
-            files_only = input("  --files-only? (y/N): ").strip().lower() in ['y', 'yes']
-            ads_only = input("  --ads-only? (y/N): ").strip().lower() in ['y', 'yes']
-            timestomp = input("  --timestomp? (y/N): ").strip().lower() in ['y', 'yes']
-            suspicious = input("  --suspicious? (y/N): ").strip().lower() in ['y', 'yes']
+            deleted_only = input("  --deleted-only? (y/N): ").strip().lower() in ["y", "yes"]
+            in_use_only = input("  --in-use-only? (y/N): ").strip().lower() in ["y", "yes"]
+            dirs_only = input("  --dirs-only? (y/N): ").strip().lower() in ["y", "yes"]
+            files_only = input("  --files-only? (y/N): ").strip().lower() in ["y", "yes"]
+            ads_only = input("  --ads-only? (y/N): ").strip().lower() in ["y", "yes"]
+            timestomp = input("  --timestomp? (y/N): ").strip().lower() in ["y", "yes"]
+            suspicious = input("  --suspicious? (y/N): ").strip().lower() in ["y", "yes"]
             min_size = input("  --min-size (bytes): ").strip()
             max_size = input("  --max-size (bytes): ").strip()
 
             output = input("Output file (default: stdout): ").strip() or "-"
 
-            sys.argv = ['MFTDigger.py', 'search', source]
+            sys.argv = ["MFTDigger.py", "search", source]
             if name:
-                sys.argv.extend(['--name', name])
+                sys.argv.extend(["--name", name])
             if path:
-                sys.argv.extend(['--path', path])
+                sys.argv.extend(["--path", path])
             if regex:
-                sys.argv.extend(['--regex', regex])
+                sys.argv.extend(["--regex", regex])
             if ext:
-                sys.argv.extend(['--ext', ext])
+                sys.argv.extend(["--ext", ext])
             if record:
-                sys.argv.extend(['--record', record])
+                sys.argv.extend(["--record", record])
             if after:
-                sys.argv.extend(['--after', after])
+                sys.argv.extend(["--after", after])
             if before:
-                sys.argv.extend(['--before', before])
+                sys.argv.extend(["--before", before])
             if time_field != "any":
-                sys.argv.extend(['--time-field', time_field])
+                sys.argv.extend(["--time-field", time_field])
             if deleted_only:
-                sys.argv.append('--deleted-only')
+                sys.argv.append("--deleted-only")
             if in_use_only:
-                sys.argv.append('--in-use-only')
+                sys.argv.append("--in-use-only")
             if dirs_only:
-                sys.argv.append('--dirs-only')
+                sys.argv.append("--dirs-only")
             if files_only:
-                sys.argv.append('--files-only')
+                sys.argv.append("--files-only")
             if ads_only:
-                sys.argv.append('--ads-only')
+                sys.argv.append("--ads-only")
             if timestomp:
-                sys.argv.append('--timestomp')
+                sys.argv.append("--timestomp")
             if suspicious:
-                sys.argv.append('--suspicious')
+                sys.argv.append("--suspicious")
             if min_size:
-                sys.argv.extend(['--min-size', min_size])
+                sys.argv.extend(["--min-size", min_size])
             if max_size:
-                sys.argv.extend(['--max-size', max_size])
-            sys.argv.extend(['-o', output])
+                sys.argv.extend(["--max-size", max_size])
+            sys.argv.extend(["-o", output])
 
             _run_menu()
-        elif choice == '11':
+        elif choice == "11":
             break
         else:
             print("Invalid option. Please try again.")
+
 
 def run_export_command():
     source = get_source_input()
@@ -3263,56 +3525,57 @@ def run_export_command():
     choice = input("Select option: ").strip()
 
     target_args = []
-    if choice == '1':
+    if choice == "1":
         record = input("Enter record number(s) (comma-separated): ").strip()
         if not record:
             print("Record number is required.")
             return
-        target_args = ['--record', record]
-    elif choice == '2':
+        target_args = ["--record", record]
+    elif choice == "2":
         path = input("Enter exact path: ").strip()
         if not path:
             print("Path is required.")
             return
-        target_args = ['--path', path]
-    elif choice == '3':
+        target_args = ["--path", path]
+    elif choice == "3":
         name = input("Enter filename pattern (glob): ").strip()
         if not name:
             print("Filename pattern is required.")
             return
-        target_args = ['--name', name]
+        target_args = ["--name", name]
     else:
         print("Invalid option.")
         return
 
     print("\nAdditional options:")
-    ads = input("Export ADS also? (y/N): ").strip().lower() in ['y', 'yes']
+    ads = input("Export ADS also? (y/N): ").strip().lower() in ["y", "yes"]
     stream = input("Export specific ADS stream (leave empty for none): ").strip()
-    include_deleted = input("Include deleted records? (y/N): ").strip().lower() in ['y', 'yes']
+    include_deleted = input("Include deleted records? (y/N): ").strip().lower() in ["y", "yes"]
     max_files = input("Max files (default 200): ").strip() or "200"
     max_size = input("Max size per file in bytes (0=unlimited): ").strip() or "0"
-    no_raw_record = input("Do not save raw MFT record? (y/N): ").strip().lower() in ['y', 'yes']
-    preserve_times = input("Preserve file timestamps? (y/N): ").strip().lower() in ['y', 'yes']
+    no_raw_record = input("Do not save raw MFT record? (y/N): ").strip().lower() in ["y", "yes"]
+    preserve_times = input("Preserve file timestamps? (y/N): ").strip().lower() in ["y", "yes"]
     out_dir = input("Output directory (default: MFTDigger_export): ").strip() or "MFTDigger_export"
 
-    sys.argv = ['MFTDigger.py', 'export', source] + target_args
+    sys.argv = ["MFTDigger.py", "export", source] + target_args
     if ads:
-        sys.argv.append('--ads')
+        sys.argv.append("--ads")
     if stream:
-        sys.argv.extend(['--stream', stream])
+        sys.argv.extend(["--stream", stream])
     if include_deleted:
-        sys.argv.append('--include-deleted')
+        sys.argv.append("--include-deleted")
     if max_files and max_files != "200":
-        sys.argv.extend(['--max-files', max_files])
+        sys.argv.extend(["--max-files", max_files])
     if max_size and max_size != "0":
-        sys.argv.extend(['--max-size', max_size])
+        sys.argv.extend(["--max-size", max_size])
     if no_raw_record:
-        sys.argv.append('--no-raw-record')
+        sys.argv.append("--no-raw-record")
     if preserve_times:
-        sys.argv.append('--preserve-times')
-    sys.argv.extend(['-o', out_dir])
+        sys.argv.append("--preserve-times")
+    sys.argv.extend(["-o", out_dir])
 
     _run_menu()
+
 
 def run_report_command():
     print("\nEnter input file (CSV/TSV/JSONL from dump/search):")
@@ -3336,13 +3599,13 @@ def run_report_command():
     format_choice = input("Select format: ").strip()
 
     format_map = {
-        '1': 'html',
-        '2': 'md',
-        '3': 'csv',
-        '4': 'tsv',
-        '5': 'jsonl',
-        '6': 'body',
-        '7': 'grid'
+        "1": "html",
+        "2": "md",
+        "3": "csv",
+        "4": "tsv",
+        "5": "jsonl",
+        "6": "body",
+        "7": "grid"
     }
 
     if format_choice not in format_map:
@@ -3360,64 +3623,65 @@ def run_report_command():
     after = input("  --after (date): ").strip()
     before = input("  --before (date): ").strip()
     time_field = input("  --time-field (default: any): ").strip() or "any"
-    deleted_only = input("  --deleted-only? (y/N): ").strip().lower() in ['y', 'yes']
-    in_use_only = input("  --in-use-only? (y/N): ").strip().lower() in ['y', 'yes']
-    dirs_only = input("  --dirs-only? (y/N): ").strip().lower() in ['y', 'yes']
-    files_only = input("  --files-only? (y/N): ").strip().lower() in ['y', 'yes']
-    ads_only = input("  --ads-only? (y/N): ").strip().lower() in ['y', 'yes']
-    timestomp = input("  --timestomp? (y/N): ").strip().lower() in ['y', 'yes']
-    suspicious = input("  --suspicious? (y/N): ").strip().lower() in ['y', 'yes']
+    deleted_only = input("  --deleted-only? (y/N): ").strip().lower() in ["y", "yes"]
+    in_use_only = input("  --in-use-only? (y/N): ").strip().lower() in ["y", "yes"]
+    dirs_only = input("  --dirs-only? (y/N): ").strip().lower() in ["y", "yes"]
+    files_only = input("  --files-only? (y/N): ").strip().lower() in ["y", "yes"]
+    ads_only = input("  --ads-only? (y/N): ").strip().lower() in ["y", "yes"]
+    timestomp = input("  --timestomp? (y/N): ").strip().lower() in ["y", "yes"]
+    suspicious = input("  --suspicious? (y/N): ").strip().lower() in ["y", "yes"]
     min_size = input("  --min-size (bytes): ").strip()
     max_size = input("  --max-size (bytes): ").strip()
 
     limit = input("Limit results (0=no limit): ").strip()
     max_rows = input("Max rows for HTML/MD (default 100000): ").strip() or "100000"
-    open_browser = input("Open HTML in browser after generation? (y/N): ").strip().lower() in ['y', 'yes'] if output_format == 'html' else False
+    open_browser = input("Open HTML in browser after generation? (y/N): ").strip().lower() in ["y", "yes"] if output_format == "html" else False
 
-    sys.argv = ['MFTDigger.py', 'report', input_file]
+    sys.argv = ["MFTDigger.py", "report", input_file]
     if name:
-        sys.argv.extend(['--name', name])
+        sys.argv.extend(["--name", name])
     if path:
-        sys.argv.extend(['--path', path])
+        sys.argv.extend(["--path", path])
     if ext:
-        sys.argv.extend(['--ext', ext])
+        sys.argv.extend(["--ext", ext])
     if record:
-        sys.argv.extend(['--record', record])
+        sys.argv.extend(["--record", record])
     if after:
-        sys.argv.extend(['--after', after])
+        sys.argv.extend(["--after", after])
     if before:
-        sys.argv.extend(['--before', before])
+        sys.argv.extend(["--before", before])
     if time_field != "any":
-        sys.argv.extend(['--time-field', time_field])
+        sys.argv.extend(["--time-field", time_field])
     if deleted_only:
-        sys.argv.append('--deleted-only')
+        sys.argv.append("--deleted-only")
     if in_use_only:
-        sys.argv.append('--in-use-only')
+        sys.argv.append("--in-use-only")
     if dirs_only:
-        sys.argv.append('--dirs-only')
+        sys.argv.append("--dirs-only")
     if files_only:
-        sys.argv.append('--files-only')
+        sys.argv.append("--files-only")
     if ads_only:
-        sys.argv.append('--ads-only')
+        sys.argv.append("--ads-only")
     if timestomp:
-        sys.argv.append('--timestomp')
+        sys.argv.append("--timestomp")
     if suspicious:
-        sys.argv.append('--suspicious')
+        sys.argv.append("--suspicious")
     if min_size:
-        sys.argv.extend(['--min-size', min_size])
+        sys.argv.extend(["--min-size", min_size])
     if max_size:
-        sys.argv.extend(['--max-size', max_size])
+        sys.argv.extend(["--max-size", max_size])
     if limit and limit != "0":
-        sys.argv.extend(['--limit', limit])
+        sys.argv.extend(["--limit", limit])
     if max_rows and max_rows != "100000":
-        sys.argv.extend(['--max-rows', max_rows])
+        sys.argv.extend(["--max-rows", max_rows])
     if open_browser:
-        sys.argv.append('--open')
+        sys.argv.append("--open")
     if output_file != "-":
-        sys.argv.extend(['-o', output_file])
-    sys.argv.extend(['--format', output_format])
+        sys.argv.extend(["-o", output_file])
+    sys.argv.extend(["--format", output_format])
 
     _run_menu()
+
 
 def run_record_command():
     source = get_source_input()
@@ -3430,16 +3694,17 @@ def run_record_command():
         print("Record number is required.")
         return
 
-    hex_dump = input("Include hexdump? (y/N): ").strip().lower() in ['y', 'yes']
-    verbose = input("Verbose output? (y/N): ").strip().lower() in ['y', 'yes']
+    hex_dump = input("Include hexdump? (y/N): ").strip().lower() in ["y", "yes"]
+    verbose = input("Verbose output? (y/N): ").strip().lower() in ["y", "yes"]
 
-    sys.argv = ['MFTDigger.py', 'record', source, record_num]
+    sys.argv = ["MFTDigger.py", "record", source, record_num]
     if hex_dump:
-        sys.argv.append('--hex')
+        sys.argv.append("--hex")
     if verbose:
-        sys.argv.append('-v')
+        sys.argv.append("-v")
 
     _run_menu()
+
 
 def run_extract_mft_command():
     source = get_source_input()
@@ -3452,8 +3717,9 @@ def run_extract_mft_command():
         print("Output file is required.")
         return
 
-    sys.argv = ['MFTDigger.py', 'extract-mft', source, '-o', output_file]
+    sys.argv = ["MFTDigger.py", "extract-mft", source, "-o", output_file]
     _run_menu()
+
 
 def show_help_examples():
     print("\n" + "="*60)
@@ -3501,7 +3767,7 @@ def show_help_examples():
     print("   MFTDigger.py export evidence.dd --record 88123,88130 --include-deleted -o recovered/")
     print()
     print("6. LOCKED EVIDENCE ON LIVE HOST")
-    print("   MFTDigger.py export C: --path \"C:\\\\Windows\\\\System32\\\\winevt\\\\Logs\\\\Security.evtx\" -o evtx\\")
+    print("   MFTDigger.py export C: --path \"C:\\Windows\\System32\\winevt\\Logs\\Security.evtx\" -o evtx\\")
     print()
     print("7. SUPER-TIMELINE")
     print("   MFTDigger.py dump evidence.dd --format body -o mft.body")
@@ -3516,6 +3782,7 @@ def show_help_examples():
     print("="*60)
     input("\nPress Enter to continue...")
 
+
 def main_menu():
     while True:
         print_banner()
@@ -3523,23 +3790,23 @@ def main_menu():
 
         choice = input("Select an option: ").strip()
 
-        if choice == '1':
+        if choice == "1":
             run_info_command()
-        elif choice == '2':
+        elif choice == "2":
             run_dump_command()
-        elif choice == '3':
+        elif choice == "3":
             run_search_command()
-        elif choice == '4':
+        elif choice == "4":
             run_export_command()
-        elif choice == '5':
+        elif choice == "5":
             run_report_command()
-        elif choice == '6':
+        elif choice == "6":
             run_record_command()
-        elif choice == '7':
+        elif choice == "7":
             run_extract_mft_command()
-        elif choice == '8':
+        elif choice == "8":
             show_help_examples()
-        elif choice == '9':
+        elif choice == "9":
             print("\nExiting MFT Digger. Goodbye!")
             break
         else:

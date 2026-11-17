@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  suite:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Fetch DFTT image
+        continue-on-error: true
+        run: python tests/fetch_images.py dftt7
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  python38:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  cross-validation:
+    runs-on: ubuntu-latest
+    env:
+      MFTDIGGER_DFR: dfr-04-ntfs,dfr-07-one-ntfs,dfr-07-two-ntfs,dfr-10-ntfs,dfr-11-compress-ntfs,dfr-12-ntfs,dfr-13-ntfs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install The Sleuth Kit and ntfs-3g
+        run: sudo apt-get update && sudo apt-get install -y sleuthkit ntfs-3g attr
+      - name: Install the parsers used for comparison
+        continue-on-error: true
+        run: python -m pip install mft dissect.ntfs analyzeMFT
+      - name: Fetch images
+        run: python tests/fetch_images.py dftt7 dftt3 dftt8 dftt10-disk dftt10-part1 dftt10-part2 dfr-04-ntfs dfr-07-one-ntfs dfr-07-two-ntfs dfr-10-ntfs dfr-11-compress-ntfs dfr-12-ntfs dfr-13-ntfs
+      - name: Public images and The Sleuth Kit
+        run: python -m unittest discover -s tests -p "test_public_images.py" -v && python -m unittest discover -s tests -p "test_sleuthkit.py" -v
+      - name: Other tools
+        run: python -m unittest discover -s tests -p "test_other_tools.py" -v
+      - name: ntfs-3g volume
+        run: sudo "$(which python)" -m unittest discover -s tests -p "test_ntfs3g.py" -v
